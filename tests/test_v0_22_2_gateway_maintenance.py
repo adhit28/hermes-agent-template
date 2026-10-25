@@ -181,7 +181,8 @@ class GatewayMaintenanceTests(ConfigSafetyFixture, unittest.IsolatedAsyncioTestC
     async def test_unrelated_native_api_is_not_serialized_as_gateway_lifecycle(self):
         # model/set now participates in setup's settings transaction; a
         # read-only credential validation still bypasses that lifecycle lock.
-        request = Request({"type": "http", "method": "POST", "path": "/api/providers/validate", "headers": []})
+        cookie = f"hermes_auth={self.server._make_auth_token()}".encode()
+        request = Request({"type": "http", "method": "POST", "path": "/api/providers/validate", "headers": [(b"cookie", cookie)]})
         self.server._proxy_to_dashboard = AsyncMock(return_value=JSONResponse({"ok": True}))
         async with self.server.lifecycle_lock:
             response = await self.server.route_proxy(request)

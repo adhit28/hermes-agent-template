@@ -483,6 +483,7 @@ except TimeoutError:
             self.assertEqual((await handler(req)).status_code, 503)
 
     async def test_native_settings_writes_cannot_interleave_a_setup_transaction(self):
+        self.server._is_authenticated = Mock(return_value=True)
         def proxy(_):
             self.assertTrue(self.server.lifecycle_lock.locked())
             return self.server.JSONResponse({"ok": True})

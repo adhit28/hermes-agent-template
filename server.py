@@ -1726,6 +1726,12 @@ async def login_post(request: Request) -> Response:
 
 async def login_redirect(request: Request) -> Response:
     """GET /login — keep old bookmarks working after the move to /setup/login."""
+    # Native Desktop authorization redirects its system browser here with a
+    # PKCE cookie. Keep that flow in Hermes, even if Safari also has our admin
+    # cookie; replacing it with the setup login loses the Desktop broker state.
+    if any(request.cookies.get(prefix + "hermes_session_pkce")
+           for prefix in ("__Host-", "__Secure-", "")):
+        return await _proxy_native_dashboard(request)
     rt = request.query_params.get("returnTo") or request.query_params.get("next") or "/"
     return RedirectResponse(
         f"/setup/login?returnTo={_url_quote(_safe_return_to(rt))}", status_code=302
@@ -4670,11 +4676,34 @@ It may still be starting up, or it may have crashed.</p>
 </body></html>""" % HERMES_DASHBOARD_PORT
 
 
-async def _proxy_to_dashboard(request: Request) -> Response:
-    """Forward an authenticated request to the Hermes dashboard subprocess.
+async def _native_dashboard_ready() -> bool:
+    """Never expose the loopback dashboard unless its own auth gate is on."""
+    if preparation["state"] != "ready" or not hermes_dashboard_public_url():
+        return False
+    try:
+        # Build the request directly: the shared HTTP client's cookie jar may
+        # contain our privileged internal session. Discovery must be anonymous.
+        response = await get_http_client().send(httpx.Request(
+            "GET", f"{HERMES_DASHBOARD_URL}/api/status",
+            extensions={"timeout": {"connect": 5, "read": 5, "write": 5, "pool": 5}},
+        ), follow_redirects=False)
+        return response.status_code == 200 and response.json().get("auth_required") is True
+    except (httpx.RequestError, ValueError, AttributeError):
+        return False
 
-    Assumes edge auth (basic auth middleware) has already validated the caller.
-    HTTP-only: the native Hermes dashboard does not use WebSockets.
+
+async def _proxy_native_dashboard(request: Request) -> Response:
+    """Forward Desktop login/API requests using only the caller's credentials."""
+    if not await _native_dashboard_ready():
+        return JSONResponse({"error": "Authenticated Hermes dashboard unavailable"}, status_code=503)
+    return await _proxy_to_dashboard(request, native_auth=True)
+
+
+async def _proxy_to_dashboard(request: Request, *, native_auth: bool = False) -> Response:
+    """Proxy HTTP using the edge admin session or the native caller's credentials.
+
+    Native callers must first pass _native_dashboard_ready; Hermes then owns
+    authentication. Only authenticated edge callers may borrow our session.
     """
     client = get_http_client()
     target = f"{HERMES_DASHBOARD_URL}{request.url.path}"
@@ -4689,12 +4718,19 @@ async def _proxy_to_dashboard(request: Request) -> Response:
 
     async def send(session: dict[str, str]) -> httpx.Response:
         headers = dict(req_headers)
+        if native_auth:
+            # Preserve bearer tokens and PKCE/session cookies, but never merge
+            # in the shared client's cookies or our server-held admin session.
+            headers.pop("x-forwarded-prefix", None)
+            return await client.send(httpx.Request(
+                request.method, target, headers=headers, content=body,
+            ), follow_redirects=False)
         merged = _merge_session_cookie(headers.pop("cookie", None), session)
         if merged:
             headers["cookie"] = merged
         return await client.request(request.method, target, headers=headers, content=body)
 
-    generation, session = hermes_session.snapshot()
+    generation, session = (0, {}) if native_auth else hermes_session.snapshot()
     try:
         upstream = await send(session)
         # hermes' auth gate is on (we declare a public URL so MCP OAuth
@@ -4703,7 +4739,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
         # once and replay. The browser must never receive that redirect: /login
         # is OUR route, so forwarding it would bounce the user straight back
         # here, forever.
-        if _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
+        if not native_auth and _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
             if await hermes_session.refresh(generation):
                 _, session = hermes_session.snapshot()
                 upstream = await send(session)
@@ -4716,7 +4752,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     # Still unauthenticated after a fresh login — credentials genuinely don't
     # match what the dashboard subprocess started with. Fail visibly rather
     # than forwarding a redirect that would loop.
-    if _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
+    if not native_auth and _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
         user, _ = hermes_dashboard_credentials()
         print(f"[dashboard-auth] still unauthenticated after signing in as {user!r} — "
               f"{request.method} {request.url.path}. The dashboard subprocess was started "
@@ -4725,7 +4761,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
 
     # Surface non-2xx responses from hermes into Railway logs so we can
     # diagnose 401/500s without needing browser DevTools access.
-    if upstream.status_code >= 400:
+    if upstream.status_code >= 400 and not native_auth:
         body_snip = upstream.content[:200].decode("utf-8", errors="replace")
         print(
             f"[proxy] {request.method} {request.url.path} -> {upstream.status_code} "
@@ -4737,7 +4773,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     resp_headers = {
         k: v for k, v in upstream.headers.items()
         if k.lower() not in HOP_BY_HOP
-        and k.lower() not in ("content-encoding", "content-length")
+        and k.lower() not in ("content-encoding", "content-length", "set-cookie")
     }
 
     content = upstream.content
@@ -4745,7 +4781,7 @@ async def _proxy_to_dashboard(request: Request) -> Response:
 
     # Inject the "← Setup" widget into HTML pages so users can always return,
     # plus the immutable-install confirm shim (see IMMUTABLE_INSTALL_WARNING_JS).
-    if "text/html" in content_type and b"</body>" in content:
+    if not native_auth and "text/html" in content_type and b"</body>" in content:
         try:
             text = content.decode("utf-8", errors="replace")
             text = text.replace(
@@ -4757,11 +4793,18 @@ async def _proxy_to_dashboard(request: Request) -> Response:
         except Exception:
             pass  # on any error, fall back to raw upstream content
 
-    return Response(
+    response = Response(
         content=content,
         status_code=upstream.status_code,
         headers=resp_headers,
     )
+    # A login sets several independent cookies. Combining Set-Cookie into one
+    # comma-delimited header silently breaks PKCE, sessions, and logout.
+    for cookie in upstream.headers.get_list("set-cookie"):
+        response.headers.append("set-cookie", cookie)
+    if native_auth:
+        response.headers["cache-control"] = "no-store"
+    return response
 
 
 async def route_root(request: Request) -> Response:
@@ -4786,7 +4829,14 @@ async def route_root(request: Request) -> Response:
 
 async def route_proxy(request: Request) -> Response:
     """Catch-all: forward any unmatched path to the Hermes dashboard."""
-    if err := guard(request): return err
+    native_auth = request.url.path.startswith("/auth/") or (
+        request.url.path.startswith("/api/") and not _is_authenticated(request)
+    )
+    if native_auth:
+        if not await _native_dashboard_ready():
+            return JSONResponse({"error": "Authenticated Hermes dashboard unavailable"}, status_code=503)
+    elif err := guard(request):
+        return err
     settings_write = request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path in NATIVE_SETUP_WRITE_PATHS
     lifecycle_change = request.method == "POST" and (
         request.url.path in NATIVE_GATEWAY_LIFECYCLE_PATHS
@@ -4799,7 +4849,13 @@ async def route_proxy(request: Request) -> Response:
         # Maintenance then checks the native
         # action registry before stopping Dashboard and touching user state.
         async with lifecycle_lock:
-            if err := guard(request): return err
+            if native_auth:
+                if not await _native_dashboard_ready():
+                    return JSONResponse({"error": "Authenticated Hermes dashboard unavailable"}, status_code=503)
+            elif err := guard(request):
+                return err
+            if native_auth:
+                return await _proxy_to_dashboard(request, native_auth=True)
             return await _proxy_to_dashboard(request)
     # Leave a trail when an in-container install runs: the browser already got
     # the confirm() from IMMUTABLE_INSTALL_WARNING_JS, but this is the only
@@ -4816,6 +4872,8 @@ async def route_proxy(request: Request) -> Response:
         # install itself most likely lands on the volume.
         print(f"[proxy] toolset enable may trigger an install-on-enable: "
               f"{request.method} {request.url.path} (hermes >= v2026.8.13)", flush=True)
+    if native_auth:
+        return await _proxy_to_dashboard(request, native_auth=True)
     return await _proxy_to_dashboard(request)
 
 
@@ -5012,8 +5070,9 @@ async def ws_proxy(websocket: WebSocket) -> None:
     if preparation["state"] != "ready":
         await websocket.close(code=1013)
         return
-    # 1. Edge auth.
-    if not _is_authenticated(websocket):
+    # Edge cookies retain their existing path. Desktop instead presents a
+    # single-use ticket to Hermes; never inject or mint one on its behalf.
+    if not _is_authenticated(websocket) and not await _native_dashboard_ready():
         # Close before accept — browser sees the handshake fail (expected
         # for unauthenticated calls).
         await websocket.close(code=4401)
