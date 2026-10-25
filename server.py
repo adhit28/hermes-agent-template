@@ -1567,6 +1567,23 @@ COOKIE_NAME = "hermes_auth"
 COOKIE_MAX_AGE = 7 * 86400  # 7 days
 COOKIE_SECRET = secrets.token_bytes(32)
 
+# One private admin account: share a small process-local budget across clients.
+# Do not trust caller-controlled forwarded IPs, and do not allocate IP buckets.
+# Record before any await so parallel submissions cannot bypass the limit.
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_WINDOW_SECONDS = 60
+_login_attempts: deque[float] = deque()
+
+
+def _login_retry_after() -> int:
+    now = time.monotonic()
+    while _login_attempts and _login_attempts[0] <= now - LOGIN_WINDOW_SECONDS:
+        _login_attempts.popleft()
+    if len(_login_attempts) >= LOGIN_MAX_ATTEMPTS:
+        return max(1, int(LOGIN_WINDOW_SECONDS - (now - _login_attempts[0])) + 1)
+    _login_attempts.append(now)
+    return 0
+
 # Public paths — no auth required. Everything else is behind the cookie gate.
 PUBLIC_PATHS = {"/health", "/setup/login", "/logout"}
 
@@ -1698,30 +1715,37 @@ async def page_login(request: Request) -> Response:
     html = (LOGIN_PAGE_HTML
             .replace("__ERROR__", error_html)
             .replace("__RETURN_TO__", _html_escape(rt)))
-    return HTMLResponse(html)
+    return HTMLResponse(html, headers={"Cache-Control": "no-store"})
 
 
 async def login_post(request: Request) -> Response:
     """POST /setup/login — validate creds and set the auth cookie."""
+    retry_after = _login_retry_after()
+    if retry_after:
+        return JSONResponse({"error": "Too many sign-in attempts. Try again shortly."},
+                            status_code=429, headers={"Retry-After": str(retry_after),
+                                                     "Cache-Control": "no-store"})
     form = await request.form()
     username = str(form.get("username", ""))
     password = str(form.get("password", ""))
     return_to = _safe_return_to(str(form.get("returnTo", "/")))
 
-    valid_user = _hmac.compare_digest(username, ADMIN_USERNAME)
-    valid_pw = _hmac.compare_digest(password, ADMIN_PASSWORD)
+    valid_user = _hmac.compare_digest(username.encode("utf-8"), ADMIN_USERNAME.encode("utf-8"))
+    valid_pw = _hmac.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8"))
     if valid_user and valid_pw:
-        resp = RedirectResponse(return_to, status_code=302)
+        resp = RedirectResponse(return_to, status_code=302, headers={"Cache-Control": "no-store"})
         resp.set_cookie(
             COOKIE_NAME,
             _make_auth_token(),
             max_age=COOKIE_MAX_AGE,
             httponly=True,
+            secure=request.url.scheme == "https" or bool(hermes_dashboard_public_url()),
             samesite="lax",
             path="/",
         )
         return resp
-    return RedirectResponse(f"/setup/login?returnTo={_url_quote(return_to)}&error=1", status_code=302)
+    return RedirectResponse(f"/setup/login?returnTo={_url_quote(return_to)}&error=1", status_code=302,
+                            headers={"Cache-Control": "no-store"})
 
 
 async def page_dashboard_login(request: Request) -> Response:

@@ -70,6 +70,14 @@ In Hermes Desktop, open **Settings → Gateways → Remote gateway**, enter your
 
 Desktop discovery, authentication, bearer sessions, and chat tickets pass through to Hermes without using the template's internal admin session. This path is available only when the native dashboard confirms its authentication gate is enabled. The setup wizard, backups, and template management APIs still require the existing admin cookie. Browser dashboard login continues to work as before.
 
+### Private use and usage limits
+
+Keep dashboard credentials private and restrict messaging channels to approved users. The setup login allows ten attempts per minute across this single-admin process, returns `429` with `Retry-After` when throttled, and sets a Secure, HttpOnly cookie on Railway. Its limiter resets when the process restarts; use edge protection for stronger distributed attack resistance.
+
+In native **Config**, set finite `agent.max_turns` and `delegation.max_iterations`, limit `max_concurrent_sessions`, and enable `tool_loop_guardrails.hard_stop_enabled`. Set `tool_loop_guardrails.loop_caps.max_subagents` to bound delegation per turn. These limit individual workloads, not total daily usage. Review Cron and session loops before leaving tasks unattended.
+
+ChatGPT login does not certify a third-party integration's policy compliance. Follow [OpenAI's authentication guidance](https://learn.chatgpt.com/docs/auth) and [automation guidance](https://learn.chatgpt.com/docs/non-interactive-mode#authenticate-in-automation); API keys are the recommended default for automation. Respect quota resets and never rotate accounts or credentials to evade limits. Keep provider tokens out of source control, logs, and shared backups.
+
 Regression tests run without a listening server or model requests:
 
 ```sh

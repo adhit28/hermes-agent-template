@@ -66,6 +66,52 @@ class ProxyFixture:
         self.client.cookies.set("hermes_auth", self.server._make_auth_token())
 
 
+class AdminLoginHardeningTests(ProxyFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_setup_login_throttles_parallel_attempts_even_with_spoofed_ips(self):
+        responses = await asyncio.gather(*[
+            self.client.post("/setup/login", data={"username": "wrong", "password": "wrong"},
+                             headers={"x-forwarded-for": f"192.0.2.{index}"})
+            for index in range(20)])
+        self.assertEqual(sum(r.status_code == 302 for r in responses), 10)
+        self.assertEqual(sum(r.status_code == 429 for r in responses), 10)
+        self.assertEqual(len(self.server._login_attempts), 10)
+        for response in responses:
+            self.assertNotIn("set-cookie", response.headers)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            if response.status_code == 429:
+                self.assertGreater(int(response.headers["retry-after"]), 0)
+
+    async def test_login_budget_recovers_after_window_and_counts_valid_attempts(self):
+        data = {"username": "admin", "password": "synthetic-password"}
+        with patch.object(self.server.time, "monotonic", return_value=1000):
+            for _ in range(10):
+                self.assertEqual((await self.client.post("/setup/login", data=data)).status_code, 302)
+            self.assertEqual((await self.client.post("/setup/login", data=data)).status_code, 429)
+        with patch.object(self.server.time, "monotonic", return_value=1060):
+            self.assertEqual((await self.client.post("/setup/login", data=data)).status_code, 302)
+
+    async def test_admin_cookie_is_secure_behind_railway_tls_and_auth_is_not_cached(self):
+        for base_url in ("http://hermes.example.invalid", "https://hermes.example.invalid"):
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app),
+                                         base_url=base_url) as client:
+                response = await client.post("/setup/login", data={
+                    "username": "admin", "password": "synthetic-password", "returnTo": "//evil.invalid"})
+                self.assertEqual(response.headers["location"], "/")
+                self.assertEqual(response.headers["cache-control"], "no-store")
+                cookie = response.headers["set-cookie"].lower()
+                for flag in ("secure", "httponly", "samesite=lax"):
+                    self.assertIn(flag, cookie)
+        self.client.cookies.clear()
+        self.assertEqual((await self.client.get("/setup/login")).headers["cache-control"], "no-store")
+
+    async def test_unicode_and_empty_invalid_credentials_fail_without_server_error(self):
+        for data in ({}, {"username": "\u2603", "password": "\U0001f512"}):
+            response = await self.client.post("/setup/login", data=data)
+            self.assertEqual(response.status_code, 302)
+            self.assertIn("error=1", response.headers["location"])
+            self.assertNotIn("set-cookie", response.headers)
+
+
 class DesktopProxyTests(ProxyFixture, unittest.IsolatedAsyncioTestCase):
     async def test_anonymous_discovery_does_not_borrow_admin_cookies(self):
         response = await self.client.get("/api/status")
