@@ -66,7 +66,7 @@ Message your Telegram bot. If you're a new user, a pairing request will appear i
 
 ## Connect Hermes Desktop
 
-In Hermes Desktop, open **Settings → Gateways → Remote gateway**, enter your Railway HTTPS URL (without `/setup`), and select **Sign in**, then **Save and reconnect**. Use the dashboard credentials configured for this service. The native browser sign-in supports PKCE and returns to the Desktop app automatically.
+In Hermes Desktop, open **Settings → Gateways → Remote gateway**, enter your Railway HTTPS URL (without `/setup`), and select **Sign in**, then **Save and reconnect**. Use the dashboard credentials configured for this service. Password gateways use Hermes' own `/login` form in the embedded sign-in window; the session cookie completes Desktop's handshake automatically. Native browser sign-in with PKCE is also supported.
 
 Desktop discovery, authentication, bearer sessions, and chat tickets pass through to Hermes without using the template's internal admin session. This path is available only when the native dashboard confirms its authentication gate is enabled. The setup wizard, backups, and template management APIs still require the existing admin cookie. Browser dashboard login continues to work as before.
 

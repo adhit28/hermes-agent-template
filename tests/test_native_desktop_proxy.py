@@ -103,6 +103,7 @@ class DesktopProxyTests(ProxyFixture, unittest.IsolatedAsyncioTestCase):
         for gate in (False, None, "true"):
             self.gate = gate
             self.assertEqual((await self.client.get("/api/private")).status_code, 503)
+            self.assertEqual((await self.client.get("/login")).status_code, 503)
         self.assertTrue(all(r.url.path == "/api/status" for r in self.requests))
         self.requests.clear()
         self.gate = True
@@ -156,7 +157,7 @@ class DesktopProxyTests(ProxyFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response.headers.get_list("set-cookie")), 2)
         self.assertNotIn("internal-admin", self.requests[-1].headers.get("cookie", ""))
         self.client.cookies.clear()
-        self.assertTrue((await self.client.get("/login")).headers["location"].startswith("/setup/login"))
+        self.assertEqual((await self.client.get("/login")).text, "native login")
 
 
 @unittest.skipUnless(importlib.util.find_spec("hermes_cli"), "requires pinned Hermes source on PYTHONPATH")
@@ -274,6 +275,40 @@ class PinnedHermesAuthTests(ProxyFixture, unittest.IsolatedAsyncioTestCase):
             with patch.object(self.server.websockets, "connect", side_effect=connect):
                 await self.server.ws_proxy(socket)
             self.assertEqual(send.await_args_list[0].args[0]["type"], expected)
+
+    async def test_windows_password_window_recognizes_its_own_session_cookie(self):
+        # Desktop 0.22.5 selects the embedded cookie flow for password-only
+        # gateways. It opens /login with no PKCE cookie and waits for a Hermes
+        # session cookie, not the template's unrelated hermes_auth cookie.
+        for prior_admin_session in (False, True):
+            self.client.cookies.clear()
+            if prior_admin_session:
+                self.authenticate_admin()
+            page = await self.client.get("/login")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn("/auth/password-login", page.text)
+            response = await self.client.post("/auth/password-login", json={
+                "provider": "basic", "username": "admin", "password": "synthetic-password"})
+            self.assertEqual(response.status_code, 200)
+            names = {cookie.name for cookie in self.client.cookies.jar}
+            self.assertIn("__Host-hermes_session_at", names)
+            self.assertIn("__Host-hermes_session_rt", names)
+            # Use only the cookies Desktop recognizes, even if its window had
+            # a leftover template cookie from the unsuccessful first attempt.
+            cookies = httpx.Cookies()
+            for cookie in self.client.cookies.jar:
+                if cookie.name.startswith("__Host-hermes_session_"):
+                    cookies.jar.set_cookie(cookie)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self.server.app),
+                    base_url="https://hermes.example.invalid", cookies=cookies) as desktop:
+                identity = await desktop.get("/api/auth/me")
+                self.assertEqual(identity.status_code, 200)
+                self.assertEqual(identity.json()["user_id"], "admin")
+                ticket = await desktop.post("/api/auth/ws-ticket")
+                self.assertEqual(ticket.status_code, 200)
+                self.ticket = ticket.json()["ticket"]
+                await self.assert_websocket_ticket()
+        self.server.hermes_session.refresh.assert_not_awaited()
 
     async def test_wrong_password_invalid_bearer_and_legacy_cookie_login(self):
         response = await self.client.post("/auth/password-login", json={

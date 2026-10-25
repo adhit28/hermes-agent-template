@@ -1724,18 +1724,12 @@ async def login_post(request: Request) -> Response:
     return RedirectResponse(f"/setup/login?returnTo={_url_quote(return_to)}&error=1", status_code=302)
 
 
-async def login_redirect(request: Request) -> Response:
-    """GET /login — keep old bookmarks working after the move to /setup/login."""
-    # Native Desktop authorization redirects its system browser here with a
-    # PKCE cookie. Keep that flow in Hermes, even if Safari also has our admin
-    # cookie; replacing it with the setup login loses the Desktop broker state.
-    if any(request.cookies.get(prefix + "hermes_session_pkce")
-           for prefix in ("__Host-", "__Secure-", "")):
-        return await _proxy_native_dashboard(request)
-    rt = request.query_params.get("returnTo") or request.query_params.get("next") or "/"
-    return RedirectResponse(
-        f"/setup/login?returnTo={_url_quote(_safe_return_to(rt))}", status_code=302
-    )
+async def page_dashboard_login(request: Request) -> Response:
+    """Hermes Desktop's provider form, for both cookie and native PKCE login."""
+    # Password-only gateways use the embedded Desktop window WITHOUT a PKCE
+    # cookie. It must receive Hermes' own session cookie after password login;
+    # the template's /setup/login cookie cannot complete that handshake.
+    return await _proxy_native_dashboard(request)
 
 
 async def logout(request: Request) -> Response:
@@ -5157,13 +5151,9 @@ ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 routes = [
     # Public — no auth required.
     Route("/health",                            route_health),
-    # Our sign-in lives under /setup/* so the bare /login path stays free.
-    # hermes' own gated dashboard redirects unauthenticated requests there, and
-    # a route of ours at /login would answer instead — the browser would bounce
-    # between the two forever (reproduced on v2026.8.27: 8 redirects, then the
-    # browser gives up). The proxy re-logins internally so that redirect should
-    # never reach a browser, but the path stays clear regardless.
-    Route("/login",                             login_redirect,      methods=["GET"]),
+    # Desktop owns the native provider form; template admins still sign in at
+    # /setup/login. Native responses never borrow the proxy's admin session.
+    Route("/login",                             page_dashboard_login, methods=["GET"]),
     Route("/logout",                            logout),
 
     # Our setup wizard + management API, all under /setup/* (cookie-auth guarded).
